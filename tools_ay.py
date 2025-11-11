@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.nn.parameter import Parameter
 
 # =========================
 # Helpers
@@ -374,6 +375,68 @@ def CDU(X, Z, phi, n_iters=50, lr=1e-2):
 
     return phi.detach()
 
+def CDU_Decorrelation(X, Z, phi, gamma=1e-2, n_iters=50, lr=1e-2):
+    """
+    Optimise phi avec:
+    L(phi) = 0.5 * ||X - X_hat||^2 + gamma * ||phi_flat^T @ phi_flat - I||_F^2
+    s.t. ||phi_k||=1
+
+    X:   (S,N,P)
+    Z:   (S,K,T)
+    phi: (K,L,P)
+    gamma: Regularisation de décorrélation (poids du terme d'orthogonalité)
+    returns: updated phi (K,L,P)
+    """
+    
+    # Simuler to_tensor
+    def to_tensor(data, device, requires_grad=False):
+        if not isinstance(data, torch.Tensor):
+            data = torch.tensor(data, dtype=torch.float32, device=device)
+        return data.requires_grad_(requires_grad)
+
+    device = X.device
+    S, N, P = X.shape
+    K, L, P2 = phi.shape
+    assert P2 == P
+
+    X = to_tensor(X, device)
+    Z = to_tensor(Z, device)
+    phi = to_tensor(phi, device, requires_grad=True)
+    phi = Parameter(phi) # Enveloppe pour l'optimiseur
+
+    opt = torch.optim.Adam([phi], lr=lr)
+
+    for _ in range(n_iters):
+        opt.zero_grad()
+        
+        # 1. Terme de Reconstruction (Normalisé)
+        X_hat = reconstruct_from_Z_phi(Z, phi, N)  # (S,N,P)
+        loss_recon = 0.5 * torch.sum((X - X_hat) ** 2)
+        
+        # NORMALISATION : Diviser par le nombre total d'éléments
+        # Cela transforme la perte en MSE moyenne
+        num_elements = S * N * P
+        loss_recon_norm = loss_recon / num_elements 
+        
+        # 2. Terme de Décorrélation (inchangé)
+        phi_flat = phi.view(K, -1)
+        gram_matrix = torch.matmul(phi_flat, phi_flat.transpose(0, 1))
+        I = torch.eye(K, device=device)
+        loss_decorrelation = torch.norm(gram_matrix - I, p='fro')**2
+        
+        # 3. Perte Totale
+        # Utiliser loss_recon_norm
+        loss = loss_recon_norm + gamma * loss_decorrelation
+        
+        # 4. Backpropagation et Mise à Jour
+        loss.backward()
+        opt.step()
+        
+        # 5. Projection (Contrainte de norme unitaire)
+        with torch.no_grad():
+            unit_norm_atoms_(phi) # Applique la contrainte ||phi_k||=1 in-place
+
+    return phi.detach()
 
 # =========================
 # Smoke test

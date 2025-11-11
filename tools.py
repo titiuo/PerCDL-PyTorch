@@ -154,6 +154,208 @@ def CSC(X, Z, phi, lam, step_size=0.01, n_inner=20):
 
     return Z
 
+def CSC_l0(X, Z, phi, lam, step_size=0.01, n_inner=20):
+    """
+    Convolutional Sparse Coding (CSC) model using Iterative Hard Thresholding (IHT) 
+    for L0 regularization and non-negativity constraint.
+
+    Parameters:
+    - X: input signals (S x N x P)
+    - Z: activations (S x K x N-L+1)
+    - phi: dictionary atoms (K x L x P)
+    - lam: L0 regularization parameter (lambda)
+    - step_size: Gradient step size (tau)
+    - n_inner: Number of inner proximal gradient iterations
+    
+    Returns:
+    - Z: updated activations
+    """
+
+    S, N, P = X.shape  # X is S x N x P
+    device = X.device
+    
+    # Assurer que les tenseurs sont sur le même device
+    phi = phi.to(device)
+    Z = Z.to(device)
+    K, L, P_phi = phi.shape
+
+    # Vérifications des dimensions
+    assert P == P_phi, f"Mismatch in signal channels: X has {P}, phi has {P_phi}"
+    assert Z.shape == (S, K, N-L+1), f"Z should have shape (S,K,N-L+1), got {Z.shape}"
+
+    # Précalculer phi 'flippé' et permuté pour F.conv_transpose1d
+    # Flipper sur la dimension du temps/longueur (dims=[1])
+    phi_flip = phi.flip(dims=[1]) 
+    # Permuter pour le format attendu par conv_transpose1d: (K, P, L) -> (out_channels, in_channels, kernel_size)
+    phi_conv = phi_flip.permute(0, 2, 1)  # K x P x L
+
+    # Calcul du seuil T pour le Hard-Thresholding
+    # T = lam * step_size est une simplification courante pour IHT.
+    # On pourrait aussi utiliser T = sqrt(2 * lam * step_size)
+    T = lam * step_size 
+
+    for s in range(S):
+        # Permuter pour le format Pytorch Conv1d: (N x P) -> (P x N)
+        x_s = X[s].permute(1, 0).unsqueeze(0) # 1 x P x N
+
+        # Copie locale de Z pour les itérations de PGM (pas de suivi de gradient direct)
+        z_curr = Z[s].clone().detach().to(device) # K x N-L+1
+        
+        for _ in range(n_inner):
+            # 1. Calcul du Gradient du terme de Reconstruction
+            
+            # Créer une variable pour le calcul du gradient
+            z_var = z_curr.clone().detach().requires_grad_(True)
+            
+            # Reconstruire le signal: (1 x K x N-L+1) * (K x P x L) -> (1 x P x N)
+            reconstructed = F.conv_transpose1d(z_var.unsqueeze(0), phi_conv, padding=0)
+            
+            # Perte de reconstruction (L2^2)
+            loss_recon = torch.norm(x_s - reconstructed, p=2)**2
+            
+            # Calculer le gradient wrt z_var
+            if z_var.grad is not None:
+                z_var.grad.zero_()
+            loss_recon.backward()
+            grad_z = z_var.grad
+
+            with torch.no_grad():
+                # Safe-guard gradient values
+                grad_z = torch.nan_to_num(grad_z, nan=0.0, posinf=1e6, neginf=-1e6)
+
+                # Le gradient est (1 x K x N-L+1). On le ramène à (K x N-L+1) pour u.
+                grad_z = grad_z.squeeze(0) 
+
+                # 2. Étape du Gradient : u = z_curr - step_size * grad_z
+                u = z_curr - step_size * grad_z
+
+                # 3. Opérateur Proximal pour L0 (Hard-Thresholding) avec non-négativité
+                # On met à zéro tout élément de u qui est inférieur à T.
+                # L'opérateur garantit aussi z_next >= 0 puisque u est comparé à T (T > 0 si lam > 0)
+                z_next = torch.where(u >= T, u, torch.zeros_like(u))
+
+                # Assurer la stabilité numérique
+                z_next = torch.nan_to_num(z_next, nan=0.0, posinf=1e6, neginf=0.0)
+
+                z_curr = z_next
+
+        # Mettre à jour Z avec le résultat de l'itération PGM
+        Z[s] = z_curr.detach()
+
+    return Z
+
+def CSC_l0_NMS(X, Z, phi, lam, step_size=0.01, n_inner=20, nms_radius=1):
+    """
+    Convolutional Sparse Coding (CSC) model using Iterative Hard Thresholding (IHT) 
+    for L0 regularization, non-negativity, ET COMPACITÉ SPATIALE (NMS).
+
+    Parameters:
+    - X: input signals (S x N x P)
+    - Z: activations (S x K x N-L+1)
+    - phi: dictionary atoms (K x L x P)
+    - lam: L0 regularization parameter (lambda)
+    - step_size: Gradient step size (tau)
+    - n_inner: Number of inner proximal gradient iterations
+    - nms_radius: Rayon de voisinage pour la Non-Maximal Suppression (e.g., 1 position à gauche/droite)
+    
+    Returns:
+    - Z: updated activations
+    """
+
+    S, N, P = X.shape  # X is S x N x P
+    device = X.device
+    
+    # Assurer que les tenseurs sont sur le même device
+    phi = phi.to(device)
+    Z = Z.to(device)
+    K, L, P_phi = phi.shape
+    T_Z = Z.shape[2] # Taille temporelle de Z
+
+    # Vérifications des dimensions (laissées pour la robustesse)
+    assert P == P_phi, f"Mismatch in signal channels: X has {P}, phi has {P_phi}"
+    assert Z.shape == (S, K, T_Z), f"Z should have shape (S,K,N-L+1), got {Z.shape}"
+
+    # Précalculer phi 'flippé' et permuté pour F.conv_transpose1d
+    phi_flip = phi.flip(dims=[1]) 
+    phi_conv = phi_flip.permute(0, 2, 1)  # K x P x L
+
+    # Calcul du seuil T pour le Hard-Thresholding
+    T = lam * step_size 
+
+    for s in range(S):
+        # Permuter pour le format Pytorch Conv1d: (N x P) -> (P x N)
+        x_s = X[s].permute(1, 0).unsqueeze(0) # 1 x P x N
+
+        # Copie locale de Z pour les itérations de PGM
+        z_curr = Z[s].clone().detach().to(device) # K x T_Z
+        
+        for _ in range(n_inner):
+            # 1. Calcul du Gradient du terme de Reconstruction
+            
+            z_var = z_curr.clone().detach().requires_grad_(True)
+            
+            # Reconstruire le signal
+            reconstructed = F.conv_transpose1d(z_var.unsqueeze(0), phi_conv, padding=0)
+            
+            # Perte de reconstruction (L2^2)
+            loss_recon = torch.norm(x_s - reconstructed, p=2)**2
+            
+            # Calculer le gradient wrt z_var
+            if z_var.grad is not None:
+                z_var.grad.zero_()
+            loss_recon.backward()
+            grad_z = z_var.grad
+
+            with torch.no_grad():
+                # Safe-guard gradient values
+                grad_z = torch.nan_to_num(grad_z, nan=0.0, posinf=1e6, neginf=-1e6)
+                grad_z = grad_z.squeeze(0) # Ramener à (K x T_Z)
+
+                # 2. Étape du Gradient : u = z_curr - step_size * grad_z
+                u = z_curr - step_size * grad_z
+
+                # 3. Opérateur Proximal (Hard-Thresholding + Non-Negativity + NMS)
+                
+                # 3a. Hard-Thresholding (Seuillage) et Non-Négativité
+                # Seuls les éléments > T sont conservés.
+                u_seuil = torch.where(u >= T, u, torch.zeros_like(u))
+                
+                # 3b. Non-Maximal Suppression (NMS) pour forcer les diracs isolés
+                
+                # Initialiser z_next à zéro
+                z_next = torch.zeros_like(u_seuil)
+                
+                # Créer des masques pour les comparaisons gauche/droite
+                is_peak = torch.ones_like(u_seuil, dtype=torch.bool)
+                
+                # Comparaison avec les voisins pour un rayon de 'nms_radius'
+                for r in range(1, nms_radius + 1):
+                    # Comparaison avec les voisins de GAUCHE (décalage vers la droite)
+                    # Ex: si r=1, u[t] doit être > u[t-1]
+                    u_left_shifted = F.pad(u_seuil[:, :-r], (r, 0), 'constant', 0)
+                    is_peak &= (u_seuil > u_left_shifted)
+
+                    # Comparaison avec les voisins de DROITE (décalage vers la gauche)
+                    # Ex: si r=1, u[t] doit être >= u[t+1]
+                    u_right_shifted = F.pad(u_seuil[:, r:], (0, r), 'constant', 0)
+                    is_peak &= (u_seuil >= u_right_shifted)
+
+                # S'assurer que les valeurs non-nulles sont considérées (évite les faux pics à 0)
+                is_peak &= (u_seuil > 0)
+                
+                # Appliquer le masque de pic à la version seuillée de u
+                z_next[is_peak] = u_seuil[is_peak]
+                
+                # Assurer la stabilité numérique
+                z_next = torch.nan_to_num(z_next, nan=0.0, posinf=1e6, neginf=0.0)
+
+                z_curr = z_next
+
+        # Mettre à jour Z avec le résultat de l'itération PGM
+        Z[s] = z_curr.detach()
+
+    return Z
+
 def CDU(X,Z,phi,step_size=0.01):
     """
     Convolutional Dictionary Update (CDU) model.
