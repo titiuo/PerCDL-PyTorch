@@ -24,6 +24,7 @@ import json
 import os
 import tarfile
 from urllib.request import urlretrieve
+from scipy.signal import butter, filtfilt, welch
 
 #####################################################################
 #                                                                   #
@@ -877,3 +878,111 @@ def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100):
         Phi = CDU(X, Z, Phi,lr=5e-2)
 
     return Z,Phi,A
+
+
+#####################################################################
+#                                                                   #
+#                         Preprocessing                             #
+#                                                                   #
+#####################################################################
+
+
+def apply_low_pass(X, cutoff, fs, order=5):
+    """
+    Applies a zero-phase Butterworth low-pass filter.
+    Handles both a global cutoff (scalar) or specific cutoffs per signal (S x P).
+    """
+    S, N, P = X.shape
+    nyq = 0.5 * fs
+    
+    # Check if cutoff is an array matching (S, P)
+    if hasattr(cutoff, 'shape') and cutoff.shape == (S, P):
+        # Case A: Unique cutoff per signal -> We must loop
+        y = np.zeros_like(X)
+        
+        for s in range(S):
+            for p in range(P):
+                # 1. Get the specific cutoff for this signal
+                c = cutoff[s, p]
+                
+                # 2. Safety check: avoid invalid cutoffs (0 or >= Nyquist)
+                if c <= 0 or c >= nyq:
+                    # If invalid, just copy original data (or raise error)
+                    y[s, :, p] = X[s, :, p]
+                    continue
+
+                # 3. Design the filter SPECIFIC to this signal
+                normal_cutoff = c / nyq
+                b, a = butter(order, normal_cutoff, btype='low', analog=False)
+                
+                # 4. Apply filter to this 1D time series
+                y[s, :, p] = filtfilt(b, a, X[s, :, p])
+                
+        return y
+
+    # Case B: Global cutoff (scalar) -> Vectorized (Much faster)
+    else:
+        # Ensure cutoff is a float just in case
+        c = float(cutoff)
+        normal_cutoff = c / nyq
+        b, a = butter(order, normal_cutoff, btype='low', analog=False)
+        
+        # Apply along axis 1 (Time)
+        return filtfilt(b, a, X, axis=1)
+
+def find_optimal_cutoff(X, fs, percentile=0.95, method='global'):
+    """
+    Estimates the optimal cutoff frequency based on Cumulative Power.
+    
+    Parameters:
+    - X (np.array): Data of shape (S, N, P)
+    - fs (float): Sampling frequency (Hz)
+    - percentile (float): Fraction of energy to keep (0.95 = 95%)
+    - method (str): 'global' (averages PSD first, returns 1 float)
+                    'per_channel' (returns array of shape P)
+                    'per_signal' (returns array of shape S x P)
+    
+    Returns:
+    - cutoff (float or np.array): The suggested cutoff frequency/frequencies.
+    """
+    # 1. Compute PSD using Welch's method
+    # axis=1 is the time dimension (N)
+    freqs, psd = welch(X, fs=fs, nperseg=min(X.shape[1], 256), axis=1)
+    
+    # 2. Handle aggregation based on method
+    if method == 'global':
+        # Average PSD across all Observations (axis 0) and Channels (axis 2)
+        # Result shape: (Frequency_Bins,)
+        psd_processed = np.mean(psd, axis=(0, 2))
+        
+    elif method == 'per_channel':
+        # Average PSD across Observations only (axis 0)
+        # Result shape: (Frequency_Bins, P)
+        psd_processed = np.mean(psd, axis=0)
+        # Move frequency to last axis for easier cumulative sum: (P, Frequency_Bins)
+        psd_processed = np.transpose(psd_processed)
+        
+    elif method == 'per_signal':
+        # No averaging, keep all signals distinct
+        # Result shape: (S, Frequency_Bins, P) -> Transpose to (S, P, Frequency_Bins)
+        psd_processed = np.transpose(psd, (0, 2, 1))
+        
+    else:
+        raise ValueError("Method must be 'global', 'per_channel', or 'per_signal'")
+
+    # 3. Calculate Cumulative Distribution of Power
+    # Integrate (cumsum) along the last axis (Frequency bins)
+    psd_cumsum = np.cumsum(psd_processed, axis=-1)
+    
+    # Normalize by total power (last value of cumsum) to get 0.0 to 1.0 scale
+    total_power = psd_cumsum[..., -1:]
+    psd_normalized = psd_cumsum / total_power
+    
+    # 4. Find the frequency index where we cross the percentile threshold
+    # argmax finds the *first* index where the condition is True
+    cutoff_indices = np.argmax(psd_normalized >= percentile, axis=-1)
+    
+    # 5. Convert indices to actual Frequencies
+    cutoff_freqs = freqs[cutoff_indices]
+    
+    return cutoff_freqs
