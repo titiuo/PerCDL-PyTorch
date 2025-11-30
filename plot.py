@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import torch
 import torch.nn.functional as F
 from tools import time_warping_f
@@ -26,20 +27,20 @@ def check_tensors(X, Z, Phi):
 
 def plot_atoms(Phi: torch.Tensor):
     """
-    1) Affiche les atomes (Phi) par canal.
+    1) Displays atoms (Phi) per channel.
     
     Args:
-        Phi (torch.Tensor): Tenseur des atomes de forme (K, L, P).
+        Phi (torch.Tensor): Atoms tensor of shape (K, L, P).
     """
     Phi_cpu = Phi.detach().cpu()
     K, L, P = Phi_cpu.shape
     
-    print("--- 1) Affichage des atomes (Phi) ---")
+    print("--- Displaying Atoms (Phi) ---")
     fig, axs = plt.subplots(K, P, figsize=(4 * P, 2 * K))
     
     for k in range(K):
         for p in range(P):
-            # Gestion des cas spéciaux pour subplots 1x1, 1xP, Kx1
+            # Handling special cases for 1x1, 1xP, Kx1 subplots
             if K == 1 and P == 1:
                 ax = axs
             elif K == 1:
@@ -51,109 +52,153 @@ def plot_atoms(Phi: torch.Tensor):
                 
             ax.plot(np.arange(L), Phi_cpu[k, :, p])
             ax.set_title(f'Atom {k} - chan {p}')
-            ax.set_xlabel('Temps (L)')
+            ax.set_xlabel('Length (L)')
             
     plt.tight_layout()
     plt.show()
 
 def plot_reconstruction(X: torch.Tensor, Z: torch.Tensor, Phi: torch.Tensor, n_display: int = 1):
     """
-    2) Affiche la reconstruction (X_recon) et l'original (X) pour quelques sujets,
-       et calcule le MSE.
+    Displays reconstruction + original signal, with colored bars indicating 
+    activations (start time + color according to the atom).
+    If multiple atoms are activated at the same time t:
+        --> only the atom with the maximum activation is displayed.
     
     Args:
-        X (torch.Tensor): Tenseur des données originales de forme (S, N, P).
-        Z (torch.Tensor): Tenseur des activations de forme (S, K, T).
-        Phi (torch.Tensor): Tenseur des atomes de forme (K, L, P).
-        n_display (int): Nombre de sujets à afficher.
+        X (torch.Tensor): Original data tensor.
+        Z (torch.Tensor): Activations tensor.
+        Phi (torch.Tensor): Atoms tensor.
+        n_display (int): Number of subjects to display.
     """
+
+    # --- Move to CPU ---
     X_cpu = X.detach().cpu()
     Z_cpu = Z.detach().cpu()
     Phi_cpu = Phi.detach().cpu()
 
     S, N, P = X_cpu.shape
     K, L, _ = Phi_cpu.shape
-    
-    print("\n--- 2) Reconstruction et MSE par sujet ---")
+    T = Z_cpu.shape[-1]
+
+    print("\n--- Reconstruction and MSE per Subject ---")
     n_display = min(n_display, S)
-    
-    # Prépare le tenseur Phi pour la convolution transposée
-    phi_conv = Phi_cpu.permute(0, 2, 1)  # K x P x L
-    
+
+    phi_conv = Phi_cpu.permute(0, 2, 1) 
+
+    atom_colors = {0: "red", 1: "blue"} 
+
     for s in range(n_display):
-        z_s = Z_cpu[s].unsqueeze(0)  # 1 x K x T
+        z_s = Z_cpu[s].unsqueeze(0) 
+
+        recon = F.conv_transpose1d(z_s, phi_conv).squeeze(0).permute(1, 0).numpy()
+        x_s = X_cpu[s].numpy() # (N, P)
+
         
-        # Calcul de la reconstruction: Conv Transpose
-        # F.conv_transpose1d(input: 1xKxT, weight: KxPxL) -> 1xPx(T+L-1)
-        recon = F.conv_transpose1d(z_s, phi_conv, padding=0).squeeze(0).permute(1, 0)  # N x P
-        recon = recon.numpy()
-        x_s = X_cpu[s].numpy()
+        activations = []
+        for t in range(T):
+            z_t = Z_cpu[s, :, t]        
+            k_max = torch.argmax(z_t)    
+            val_max = z_t[k_max].item()
 
-        if recon.shape != x_s.shape:
-            print(f"Warning shape mismatch for subject {s}: recon {recon.shape} vs x {x_s.shape}")
-            continue # Passe au sujet suivant si la forme est incorrecte
-
-        mse = ((x_s - recon) ** 2).mean()
-        print(f'Subject {s} MSE: {mse:.6e}')
+            if val_max > 0:              
+                activations.append((int(k_max), int(t)))
 
         for p in range(P):
-            plt.figure(figsize=(12, 2.5))
-            plt.plot(x_s[:, p], label='Original $X_s$')
-            plt.plot(recon[:, p], label='Reconstruit $\hat{X}_s$', alpha=0.8)
-            plt.title(f'Sujet {s} - Canal {p} (MSE={mse:.2e})')
-            plt.legend()
-            plt.xlabel('Temps (N)')
+            
+            mse_channel = float(((x_s[:, p] - recon[:, p]) ** 2).mean())
+            
+            fig, ax = plt.subplots(figsize=(12, 3))
+
+            y_all_min = min(np.min(x_s[:, p]), np.min(recon[:, p]))
+            y_all_max = max(np.max(x_s[:, p]), np.max(recon[:, p]))
+            rng = max(y_all_max - y_all_min, 1.0)
+            margin = 0.05 * rng
+            y_bottom = y_all_min - margin
+            y_top = y_all_max + margin
+
+            for (k, t) in activations:
+                start = t
+                end = min(t + L, N) 
+                color = atom_colors.get(k, "black")
+
+                rect = patches.Rectangle(
+                    (start, y_bottom),
+                    end - start,
+                    (y_top - y_bottom),
+                    color=color,
+                    alpha=0.18,
+                    linewidth=0,
+                    zorder=0
+                )
+                ax.add_patch(rect)
+
+                seg_height = 0.08 * (y_top - y_bottom)
+                ax.plot([start, start],
+                        [y_top - seg_height, y_top],
+                        color=color,
+                        linewidth=2,
+                        zorder=2)
+
+            ax.plot(x_s[:, p], label='Original', linewidth=1.5, zorder=3)
+            ax.plot(recon[:, p], label='Reconstructed', linewidth=1.25, alpha=0.9, zorder=4)
+
+            ax.set_ylim(y_bottom, y_top)
+            ax.set_title(f"Subject {s} - Channel {p}   (MSE={mse_channel:.2e})")
+            ax.set_xlabel("Time (N)")
+            ax.legend()
+
             plt.show()
+
+
 
 def plot_activations(Z: torch.Tensor, n_display: int = 1):
     """
-    3) Affiche la série temporelle des activations parcimonieuses Z (K x T).
+    3) Displays the time series of sparse activations Z (K x T).
     
     Args:
-        Z (torch.Tensor): Tenseur des activations de forme (S, K, T).
-        n_display (int): Nombre de sujets à afficher.
+        Z (torch.Tensor): Activations tensor of shape (S, K, T).
+        n_display (int): Number of subjects to display.
     """
     Z_cpu = Z.detach().cpu()
     S, K, T = Z_cpu.shape
     time_axis = np.arange(T)
     
-    print("\n--- 3) Affichage des activations (Z) ---")
+    print("\n--- Displaying Activations (Z) ---")
     n_display = min(n_display, S)
 
     for s in range(n_display):
-        # Définir la grille de subplots (K lignes, 1 colonne)
         fig, axs = plt.subplots(K, 1, figsize=(12, 1.5 * K), sharex=True)
         
-        if K == 1: # Gérer le cas K=1
+        if K == 1: 
             axs = [axs]
             
         for k in range(K):
             ax = axs[k]
             
-            # Plot des activations pour l'atome k du sujet s
             activations_k = Z_cpu[s, k, :].numpy()
             
-            # Utiliser la fonction plot pour les séries temporelles
             ax.plot(time_axis, activations_k, marker='.', linestyle='-', markersize=4, label=f'Atom {k}')
             ax.axhline(0, color='gray', linestyle='--', linewidth=0.5)
             
             ax.set_ylabel(f'Atom {k}', rotation=0, labelpad=30, fontsize=10)
             ax.tick_params(axis='y', labelsize=8)
 
-        fig.suptitle(f'Activations Parcimonieuses Z pour le Sujet {s} (K={K} atomes)', fontsize=14, y=1.02)
-        axs[-1].set_xlabel('Temps T')
+        fig.suptitle(f'Sparse Activations Z for Subject {s} (K={K} atoms)', fontsize=14, y=1.02)
+        
+        axs[-1].set_xlabel('Time T')
         
         plt.tight_layout(rect=[0, 0, 1, 1])
         plt.show()
 
 def print_metrics(X: torch.Tensor, Z: torch.Tensor, Phi: torch.Tensor):
     """
-    4) Affiche la norme des atomes et 5) les statistiques globales de MSE.
+    Prints global MSE statistics.
+    Prints average sparsity metrics.
     
     Args:
-        X (torch.Tensor): Tenseur des données originales de forme (S, N, P).
-        Z (torch.Tensor): Tenseur des activations de forme (S, K, T).
-        Phi (torch.Tensor): Tenseur des atomes de forme (K, L, P).
+        X (torch.Tensor): Original data tensor of shape (S, N, P).
+        Z (torch.Tensor): Activations tensor of shape (S, K, T).
+        Phi (torch.Tensor): Atoms tensor of shape (K, L, P).
     """
     X_cpu = X.detach().cpu()
     Z_cpu = Z.detach().cpu()
@@ -162,48 +207,68 @@ def print_metrics(X: torch.Tensor, Z: torch.Tensor, Phi: torch.Tensor):
     S, N, P = X_cpu.shape
     K, L, _ = Phi_cpu.shape
     
-    # 4) Normes des atomes
-    norms = Phi_cpu.view(K, -1).norm(p=2, dim=1).numpy()
-    print("\n--- 4) Normes des atomes (Phi) ---")
-    print('Normes L2 des atomes:', norms)
-    
-    # 5) Statistiques globales
-    print("\n--- 5) Statistiques globales de MSE ---")
+
+    # --- 5) Global MSE Statistics ---
+    print("\n--- Global Mean Squared Error (MSE) Statistics ---")
     
     mses = []
-    phi_conv = Phi_cpu.permute(0, 2, 1)  # K x P x L
+    # Permutation for F.conv_transpose1d: (K, P, L)
+    phi_conv = Phi_cpu.permute(0, 2, 1)  
     
     for s in range(S):
         z_s = Z_cpu[s].unsqueeze(0)
-        # Calcul de la reconstruction
+        # Calculate reconstruction
         recon = F.conv_transpose1d(z_s, phi_conv, padding=0).squeeze(0).permute(1, 0).numpy()
         x_s = X_cpu[s].numpy()
         
+        # Check if dimensions match
         if recon.shape == x_s.shape:
             mses.append(((x_s - recon) ** 2).mean())
 
     if len(mses) > 0:
-        print(f"MSE médiane sur {len(mses)} sujets: {np.median(mses):.6e}")
-        print(f"MSE moyenne sur {len(mses)} sujets: {np.mean(mses):.6e}")
+        mses_np = np.array(mses)
+        print(f"Subjects analyzed: {len(mses)}")
+        print(f"MSE Mean: {np.mean(mses_np):.6e}")
+        print(f"MSE Median: {np.median(mses_np):.6e}")
+        print(f"MSE Minimum: {np.min(mses_np):.6e}")
+        print(f"MSE Maximum: {np.max(mses_np):.6e}")
+        print(f"MSE Standard Deviation: {np.std(mses_np):.6e}")
     else:
-        print("Pas de MSE calculée (forme incorrecte pour tous les sujets).")
+        print("No MSE calculated (incorrect shape for all subjects).")
+
+    # --- 6) Sparsity Statistics ---
+    # Sparsity is the number of non-zero Z elements / total number of elements in Z.
+    # Using a small threshold (1e-10) to account for potential floating-point errors.
+    
+    # Counts elements > 0
+    sparsity_level = (Z_cpu > 1e-10).sum().item() / Z_cpu.numel()
+    
+    # Average number of non-zero activations per subject
+    avg_active_coefficients = (Z_cpu > 1e-10).sum().item() / S
+    
+    print("\n--- Sparsity Statistics ---")
+    print(f"Sparsity Rate (coeffs > 0): {sparsity_level:.4%}")
+    print(f"Avg. number of active coefficients per subject: {avg_active_coefficients:.2f}")
 
 def full_plot_analysis(X: torch.Tensor, Z: torch.Tensor, Phi: torch.Tensor, n_display: int = 1):
     """
-    Fonction principale pour exécuter l'analyse complète.
+    Main function to execute the complete analysis.
     
     Args:
-        X (torch.Tensor): Tenseur des données originales.
-        Z (torch.Tensor): Tenseur des activations.
-        Phi (torch.Tensor): Tenseur des atomes.
-        n_display (int): Nombre de sujets à afficher dans la reconstruction/activation.
+        X (torch.Tensor): Original data tensor.
+        Z (torch.Tensor): Activations tensor.
+        Phi (torch.Tensor): Atoms tensor.
+        n_display (int): Number of subjects to display in the reconstruction/activation plots.
     """
-    # Exécuter les plots et métriques dans l'ordre
     plot_atoms(Phi)
     plot_reconstruction(X, Z, Phi, n_display)
     plot_activations(Z, n_display)
     print_metrics(X, Z, Phi)
 
+
+# ==============================================================================
+# UTILITY FUNCTION (Calculation Core)
+# ==============================================================================
 
 def calculate_warped_reconstructions(
     X: torch.Tensor, 
@@ -214,21 +279,21 @@ def calculate_warped_reconstructions(
     s: int
 ):
     """
-    Calcule la reconstruction originale et la reconstruction time-warped
-    pour un sujet donné (s) et retourne les données CPU et les MSE.
+    Calculates the standard (original Phi) and time-warped reconstructions 
+    for a given subject (s) and returns CPU data and channel-wise MSEs.
     """
     device = X.device
     S, N, P = X.shape
     K, L, P_phi = Phi.shape
     
     if s >= S:
-        raise ValueError(f"L'index du sujet {s} est hors limites (max {S-1}).")
+        raise ValueError(f"Subject index {s} is out of bounds (max {S-1}).")
 
     x_s = X[s].detach().cpu().numpy()  # (N, P)
     z_s = Z[s].unsqueeze(0).to(device)  # (1, K, T)
     a_s = A[s].to(device)               # (K, M)
 
-    # 1. Reconstruction avec Phi original
+    # 1. Standard Reconstruction (Original Phi)
     phi_conv = Phi.permute(0, 2, 1).to(device)  # (K, P, L)
     recon_orig = (
         F.conv_transpose1d(z_s, phi_conv, padding=0)
@@ -239,16 +304,16 @@ def calculate_warped_reconstructions(
         .numpy()
     )  # (N, P)
 
-    # 2. Reconstruction avec Phi "time-warped"
+    # 2. Time-Warped Reconstruction
     warped_phis = []
     for k in range(K):
         phi_k = Phi[k].to(device)  # (L, P)
         a_k_s = a_s[k]             # (M,)
-        # Appel de la fonction de warping
+        # Call the warping function
         warped_phi_k = time_warping_f(phi_k, a_k_s)  # (L, P) 
         
         if not isinstance(warped_phi_k, torch.Tensor):
-             raise TypeError("time_warping_f doit retourner un torch.Tensor.")
+             raise TypeError("time_warping_f must return a torch.Tensor.")
         
         warped_phis.append(warped_phi_k.unsqueeze(0))
         
@@ -264,78 +329,63 @@ def calculate_warped_reconstructions(
         .numpy()
     )  # (N, P)
 
-    # 3. Calcul du MSE
+    # 3. Calculate MSE
     if recon_orig.shape != x_s.shape or recon_warped.shape != x_s.shape:
-        print("Avertissement: Les formes de reconstruction ne correspondent pas à X. Skip MSE.")
+        print("Warning: Reconstruction shapes do not match X. Skipping MSE calculation.")
         P_val = x_s.shape[1] 
+        # Return zeros for MSE if shapes are incorrect
         return x_s, recon_orig, recon_warped, np.zeros(P_val), np.zeros(P_val)
 
+    # Calculate MSE per channel
     mse_per_channel_orig = ((x_s - recon_orig) ** 2).mean(axis=0)  # (P,)
     mse_per_channel_warped = ((x_s - recon_warped) ** 2).mean(axis=0)  # (P,)
 
     return x_s, recon_orig, recon_warped, mse_per_channel_orig, mse_per_channel_warped
 
+# ==============================================================================
+# PLOT FUNCTIONS
+# ==============================================================================
+
 def plot_warped_reconstruction(
-    X: torch.Tensor, 
-    Z: torch.Tensor, 
-    Phi: torch.Tensor, 
-    A: torch.Tensor, 
-    time_warping_f, 
-    s: int = 0
+    x_s: np.ndarray, 
+    recon_orig: np.ndarray, 
+    recon_warped: np.ndarray, 
+    mse_orig: np.ndarray, 
+    mse_warped: np.ndarray, 
+    s: int
 ):
     """
-    Affiche l'original et les deux reconstructions (standard et time-warped)
-    pour chaque canal d'un sujet spécifié (s).
+    Displays the original signal and both reconstructions (standard and time-warped)
+    for each channel of a specified subject (s).
     """
-    print(f"\n--- 1) Visualisation de la Reconstruction (Sujet {s}) ---")
+    print(f"\n--- Reconstruction Visualization (Subject {s}) ---")
     
-    try:
-        x_s, recon_orig, recon_warped, mse_orig, mse_warped = \
-            calculate_warped_reconstructions(X, Z, Phi, A, time_warping_f, s)
-    except Exception as e:
-        print(f"Erreur lors du calcul des reconstructions: {e}")
-        return
-
     P = x_s.shape[1]
     
     for p in range(P):
         plt.figure(figsize=(12, 3.5))
         plt.plot(x_s[:, p], label='Original $X_s$', linewidth=1.5, color='black')
-        plt.plot(recon_orig[:, p], label='Recon (Φ original)', alpha=0.7, linestyle='--')
-        plt.plot(recon_warped[:, p], label='Recon (Φ time-warped)', alpha=0.7, linestyle='-')
+        plt.plot(recon_orig[:, p], label='Recon (Original Φ)', alpha=0.7, linestyle='--')
+        plt.plot(recon_warped[:, p], label='Recon (Time-Warped Φ)', alpha=0.7, linestyle='-')
         
         plt.title(
-            f'Sujet {s} - Canal {p}\n'
-            f'MSE original={mse_orig[p]:.4e} | MSE warped={mse_warped[p]:.4e}'
+            f'Subject {s} - Channel {p}\n'
+            f'MSE Original={mse_orig[p]:.4e} | MSE Warped={mse_warped[p]:.4e}'
         )
-        plt.xlabel('Temps (N)')
+        plt.xlabel('Time (N)')
         plt.ylabel('Amplitude')
         plt.legend()
         plt.grid(True, linestyle=':', alpha=0.6)
         plt.tight_layout()
         plt.show()
 
-def plot_mse_comparison(
-    X: torch.Tensor, 
-    Z: torch.Tensor, 
-    Phi: torch.Tensor, 
-    A: torch.Tensor, 
-    time_warping_f, 
-    s: int = 0
-):
+def plot_mse_comparison(mse_orig: np.ndarray, mse_warped: np.ndarray, s: int):
     """
-    Affiche un barplot comparant le MSE par canal pour la reconstruction
-    standard (Phi) et la reconstruction time-warped (Phi_warped).
+    Displays a bar plot comparing the MSE per channel for standard 
+    and time-warped reconstruction.
     """
-    print(f"\n--- 2) Barplot de Comparaison des MSE (Sujet {s}) ---")
+    print(f"\n--- MSE Comparison Barplot (Subject {s}) ---")
     
-    try:
-        _, _, _, mse_orig, mse_warped = \
-            calculate_warped_reconstructions(X, Z, Phi, A, time_warping_f, s)
-    except Exception as e:
-        print(f"Erreur lors du calcul des MSE: {e}")
-        return
-
     P = len(mse_orig)
     x_axis = np.arange(P)
     bar_width = 0.35
@@ -346,7 +396,7 @@ def plot_mse_comparison(
         x_axis - bar_width/2, 
         mse_orig, 
         width=bar_width, 
-        label='Φ original', 
+        label='Original Φ', 
         color='skyblue', 
         edgecolor='black'
     )
@@ -354,65 +404,57 @@ def plot_mse_comparison(
         x_axis + bar_width/2, 
         mse_warped, 
         width=bar_width, 
-        label='Φ time-warped', 
+        label='Time-Warped Φ', 
         color='lightcoral', 
         edgecolor='black'
     )
     
-    plt.xlabel('Canal (P)')
-    plt.ylabel('Erreur Quadratique Moyenne (MSE)')
-    plt.title(f'Comparaison du MSE par Canal - Sujet {s}')
-    plt.xticks(x_axis, [f'Canal {p}' for p in range(P)])
-    plt.yscale('log') # Utilisation de l'échelle log pour mieux visualiser les petites valeurs
+    plt.xlabel('Channel (P)')
+    plt.ylabel('Mean Squared Error (MSE)')
+    plt.title(f'MSE Comparison per Channel - Subject {s}')
+    plt.xticks(x_axis, [f'Channel {p}' for p in range(P)])
+    plt.yscale('log') # Use log scale for better visualization of small values
     plt.legend()
     plt.grid(axis='y', linestyle=':', alpha=0.7)
     plt.tight_layout()
     plt.show()
 
-def print_warping_metrics(
-    X: torch.Tensor, 
-    Z: torch.Tensor, 
-    Phi: torch.Tensor, 
-    A: torch.Tensor, 
-    time_warping_f, 
-    s: int = 0
-):
+def plot_personalized_vs_general_atoms_by_channel(Phi: torch.Tensor, A: torch.Tensor, time_warping_f, s: int):
     """
-    Calcule et imprime les MSE par canal et globales pour les deux reconstructions.
+    Displays the general and personalized (time-warped) atoms for each channel
+    of a given subject.
     """
-    print(f"\n--- 3) Métriques de Reconstruction (Sujet {s}) ---")
-    
-    try:
-        _, _, _, mse_orig, mse_warped = \
-            calculate_warped_reconstructions(X, Z, Phi, A, time_warping_f, s)
-    except Exception as e:
-        print(f"Erreur lors du calcul des métriques: {e}")
-        return
+    print(f"\n--- General vs. Personalized Atoms (Subject {s}) ---")
 
-    P = len(mse_orig)
-    
-    print("\n📊 MSE par canal (Comparaison):")
+    K, L, P = Phi.shape
+
     for p in range(P):
-        print(f"  Canal {p}: Original={mse_orig[p]:.4e}, Warped={mse_warped[p]:.4e}")
+        fig, axes = plt.subplots(K, 1, figsize=(12, 2.5*K), sharex=True)
+        if K == 1:
+            axes = [axes]  # ensure it is always a list
 
-    # MSE Globale pour le sujet s
-    mse_global_orig = np.mean(mse_orig)
-    mse_global_warped = np.mean(mse_warped)
-    
-    print("\n📈 MSE Globale:")
-    print(f"  MSE Globale (Φ original): {mse_global_orig:.4e}")
-    print(f"  MSE Globale (Φ time-warped): {mse_global_warped:.4e}")
-    
-    if mse_global_warped < mse_global_orig:
-        gain = ((mse_global_orig - mse_global_warped) / mse_global_orig) * 100
-        print(f"  Gain de réduction d'erreur: {gain:.2f} %")
-    elif mse_global_orig == 0:
-        print("  MSE originale est zéro, impossible de calculer le gain.")
-    else:
-        # Note: Si le MSE warped est plus grand, ce n'est pas un gain, mais une perte
-        loss = ((mse_global_warped - mse_global_orig) / mse_global_orig) * 100
-        print(f"  Perte de performance: {loss:.2f} %")
+        for k, ax in enumerate(axes):
+            phi_k = Phi[k]  # (L, P)
+            a_k_s = A[s, k]
+            
+            # Warping calculation must handle device transfer if needed
+            warped_phi_k = time_warping_f(phi_k.to(A.device), a_k_s.to(A.device)).cpu()
 
+            ax.plot(phi_k[:, p].cpu().numpy(), '--', label=f'General - Atom {k}', alpha=0.7)
+            ax.plot(warped_phi_k[:, p].numpy(), '-', label=f'Personalized Subject {s} - Atom {k}', alpha=0.7)
+            
+            ax.set_ylabel('Amplitude')
+            ax.legend()
+            ax.grid(True, linestyle=':', alpha=0.6)
+
+        axes[-1].set_xlabel('Time (L)')
+        fig.suptitle(f'Channel {p} : General vs. Personalized Atoms (Subject {s})', fontsize=14)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+# ==============================================================================
+# MAIN ANALYSIS FUNCTION
+# ==============================================================================
 
 def full_warping_analysis(
     X: torch.Tensor, 
@@ -423,13 +465,68 @@ def full_warping_analysis(
     s: int = 0
 ):
     """
-    Exécute l'analyse complète de la reconstruction avec time-warping
-    pour un sujet donné.
-    """
-    print(f"\n===========================================================")
-    print(f"  Analyse Complète Time-Warping - Sujet {s} / {X.shape[0]}")
-    print(f"===========================================================")
+    Executes the complete reconstruction analysis with time-warping
+    for a given subject (s).
     
-    print_warping_metrics(X, Z, Phi, A, time_warping_f, s)
-    plot_warped_reconstruction(X, Z, Phi, A, time_warping_f, s)
-    plot_mse_comparison(X, Z, Phi, A, time_warping_f, s)
+    Args:
+        X (torch.Tensor): Original data tensor.
+        Z (torch.Tensor): Activations tensor.
+        Phi (torch.Tensor): General atoms tensor.
+        A (torch.Tensor): Personalized parameters tensor (e.g., warping coeffs).
+        time_warping_f: The warping function (e.g., time_warping_f(phi_k, a_k_s)).
+        s (int): Index of the subject to analyze and display.
+    """
+    
+    S = X.shape[0]
+
+    # --- Initial Printout ---
+    print(f"\n===========================================================")
+    print(f"  FULL TIME-WARPING ANALYSIS - Subject {s} of {S}")
+    print(f"===========================================================")
+
+    try:
+        # Calculate reconstructions and MSEs once
+        x_s, recon_orig, recon_warped, mse_orig, mse_warped = \
+            calculate_warped_reconstructions(X, Z, Phi, A, time_warping_f, s)
+        
+    except Exception as e:
+        print(f"\nFATAL ERROR during reconstruction calculation for Subject {s}: {e}")
+        return
+
+    # --- 4) Print Metrics ---
+    
+    print(f"\n--- Reconstruction Metrics (Subject {s}) ---")
+    
+    P = len(mse_orig)
+    
+    print("\n MSE per Channel (Comparison):")
+    for p in range(P):
+        print(f"  Channel {p}: Original={mse_orig[p]:.4e}, Warped={mse_warped[p]:.4e}")
+
+    # Global MSE for subject s
+    mse_global_orig = np.mean(mse_orig)
+    mse_global_warped = np.mean(mse_warped)
+    
+    print("\n Global MSE:")
+    print(f"  Global MSE (Original Φ): {mse_global_orig:.4e}")
+    print(f"  Global MSE (Time-Warped Φ): {mse_global_warped:.4e}")
+    
+    if mse_global_warped < mse_global_orig:
+        gain = ((mse_global_orig - mse_global_warped) / mse_global_orig) * 100
+        print(f"  Error Reduction Gain: {gain:.2f} %")
+    elif mse_global_orig == 0:
+        print("  Original MSE is zero, cannot calculate gain.")
+    else:
+        # Note: If warped MSE is larger, it's a loss
+        loss = ((mse_global_warped - mse_global_orig) / mse_global_orig) * 100
+        print(f"  Performance Loss: {loss:.2f} %")
+
+
+    # --- 1) Plot Reconstruction ---
+    plot_warped_reconstruction(x_s, recon_orig, recon_warped, mse_orig, mse_warped, s)
+    
+    # --- 2) Plot MSE Comparison ---
+    plot_mse_comparison(mse_orig, mse_warped, s)
+    
+    # --- 3) Plot Atoms Comparison ---
+    plot_personalized_vs_general_atoms_by_channel(Phi, A, time_warping_f, s)

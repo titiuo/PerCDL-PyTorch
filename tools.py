@@ -31,6 +31,32 @@ from urllib.request import urlretrieve
 #                                                                   #
 #####################################################################
 
+def orthogonalize_phi(phi):
+    """
+    Orthogonalise les atomes entre eux et normalise chacun.
+    phi: (K, L, P)
+    """
+    K, L, P = phi.shape
+    phi_flat = phi.reshape(K, L*P).clone()
+    
+    # Gram-Schmidt classique
+    for i in range(K):
+        for j in range(i):
+            proj = (phi_flat[i] @ phi_flat[j]) / (phi_flat[j] @ phi_flat[j])
+            phi_flat[i] = phi_flat[i] - proj * phi_flat[j]
+        # Normalisation
+        norm_i = phi_flat[i].norm()
+        if norm_i > 0:
+            phi_flat[i] = phi_flat[i] / norm_i
+        else:
+            # au cas où l'atome est nul, on le laisse tel quel
+            phi_flat[i] = phi_flat[i]
+    
+    phi_ortho = phi_flat.reshape(K, L, P)
+    return phi_ortho
+
+
+
 def to_tensor(x, device, requires_grad: bool = False, dtype=torch.float32):
     """Safe wrapping to tensor without copy-construct warnings."""
     if torch.is_tensor(x):
@@ -93,7 +119,9 @@ def reconstruct_from_Z_phi_personalized(Z, phi, A, f, N=None):
 
 def reconstruct_from_Z_phi(Z, phi, N=None):
     """
-    Z:   (S, K, T) with T = N-L+1
+    Reconstruction du signal X_hat = phi * Z en utilisant la Transposée de Convolution.
+    
+    Z:   (S, K, T) 
     phi: (K, L, P)
     returns X_hat: (S, N, P)
     """
@@ -102,9 +130,19 @@ def reconstruct_from_Z_phi(Z, phi, N=None):
     assert K2 == K
     if N is None:
         N = T + L - 1
-    weight = phi.permute(2, 0, 1).flip(-1).contiguous()  
-    y = F.conv1d(Z, weight, padding=L - 1)               
-    return y.permute(0, 2, 1)                            
+    
+    weight_transpose = phi.permute(0, 2, 1).contiguous() 
+    
+    y = F.conv_transpose1d(
+        Z,                           # Input: (S, K, T)
+        weight_transpose,            # Weight: (K, P, L) 
+        padding=0
+    )
+    
+    if y.shape[2] > N:
+         y = y[..., :N]
+    
+    return y.permute(0, 2, 1)                         
 
 
 #####################################################################
@@ -129,7 +167,7 @@ def setInitialValues(X,K,M,L):
     - A: initial personalization parameters (S x K x M)
     """
     S, N, P = X.shape  
-    Phi = torch.randn(K, L, P) * 1e-2
+    Phi = torch.randn(K, L, P) * 1.0
     Phi = unit_norm_atoms_(Phi)
     Z = torch.rand(S, K, N-L+1) * 0.01
     A = torch.zeros(S, K, M)
@@ -269,7 +307,7 @@ def CSC_l0(X, Z, phi, lam, step_size=0.01, n_inner=20):
 
     return Z
 
-def CSC_l0_NMS(X, Z, phi, lam, step_size=0.01, n_inner=20, nms_radius=1):
+def CSC_l0_NMS(X, Z, phi, lam, step_size=0.01, n_inner=20, nms_radius=2):
     """
     Convolutional Sparse Coding (CSC) model using Iterative Hard Thresholding (IHT) 
     for L0 regularization, non-negativity, ET COMPACITÉ SPATIALE (NMS).
@@ -354,6 +392,156 @@ def CSC_l0_NMS(X, Z, phi, lam, step_size=0.01, n_inner=20, nms_radius=1):
     return Z
 
 
+import torch
+
+def CSC_L0_DP(X, Z, phi, lam, eps_reg=1e-6):
+    """
+    Corrected CSC_L0 DP implementation following the paper's formulas.
+    X: (S, N, P)
+    Z: (S, K, T_Z) used only for shape
+    phi: (K, L, P)
+    lam: scalar (must be on same scale as ||P y||^2)
+    """
+    phi = orthogonalize_phi(phi)
+    S, N, P = X.shape
+    device = X.device
+    K, L, P_phi = phi.shape
+    assert P == P_phi
+    T_Z = N - L + 1
+
+    D_matrix = phi.reshape(K, L * P).T.to(device)  # (L*P) x K
+
+    G = D_matrix.T @ D_matrix  # K x K
+    reg = eps_reg * torch.eye(K, device=device)
+    try:
+        G_inv = torch.linalg.inv(G + reg)
+    except Exception:
+        G_inv = torch.linalg.pinv(G + reg)
+
+    P_tilde = G_inv @ D_matrix.T  # K x (L*P)
+
+    Z_out = torch.zeros(S, K, T_Z, device=device)
+
+    for s in range(S):
+        x_s = X[s]  # (N, P)
+        optimal_coeffs = torch.zeros(T_Z, K, device=device)
+        reconstruction_norm_sq = torch.zeros(T_Z, device=device)
+
+        for t in range(T_Z):
+            y_block = x_s[t:t+L, :].reshape(-1)  # (L*P,)
+            u_t = P_tilde @ y_block
+            optimal_coeffs[t] = u_t
+
+            reconstruction = D_matrix @ u_t
+            reconstruction_norm_sq[t] = torch.sum(reconstruction ** 2)
+
+        segment_costs = lam - reconstruction_norm_sq  # length T_Z
+
+        V = torch.zeros(T_Z + 1, device=device)
+        t_prev_opt = torch.zeros(T_Z + 1, dtype=torch.long, device=device)
+
+        for t in range(L, T_Z + 1):
+            idx_Z = t - L
+            cost_no_activation = V[t - 1]
+            cost_with_activation = V[idx_Z] + segment_costs[idx_Z]
+            if cost_with_activation < cost_no_activation:
+                V[t] = cost_with_activation
+                t_prev_opt[t] = idx_Z  
+            else:
+                V[t] = cost_no_activation
+                t_prev_opt[t] = t_prev_opt[t - 1]
+
+        current_t = T_Z
+        while current_t >= L:
+            if t_prev_opt[current_t] == current_t - L:
+                t_start = current_t - L
+                Z_out[s, :, t_start] = optimal_coeffs[t_start].clamp(min=0.0)  # clamp if you want non-negativity
+                current_t = t_start
+            else:
+                current_t -= 1
+
+    return Z_out.detach()
+
+
+def CSC_L0_DP_AMO(X, Z, phi, lam):
+    """
+    Convolutional Sparse Coding (CSC) with AtMostOneActivation constraint.
+    (CSC-L0 regime 2 from Truong & Moreau, 2024)
+
+    Parameters:
+    - X: input signals (S x N x P)
+    - Z: activations (S x K x N-L+1) (Used for shape/dimension initialization only)
+    - phi: dictionary atoms (K x L x P)
+    - lam: L0 regularization parameter (lambda), threshold on squared correlation.
+
+    Returns:
+    - Z: The optimal activations (S x K x N-L+1), non-zero in at most one entry per column.
+    """
+
+    S, N, P = X.shape
+    device = X.device
+    K, L, P_phi = phi.shape
+    T_Z = N - L + 1
+    assert P == P_phi
+
+    D_matrix = phi.reshape(K, L * P).to(device)
+    
+    Z_out = torch.zeros(S, K, T_Z, device=device)
+
+    for s in range(S):
+        x_s = X[s].T.reshape(-1) # (P*N)
+        
+        correlations_sq = torch.zeros(T_Z, K, device=device) 
+        optimal_coeffs = torch.zeros(T_Z, K, device=device) # T_Z x K
+        
+        for t in range(T_Z):
+            y_block = x_s[t*P : (t+L)*P] 
+            
+            corr_k = torch.matmul(D_matrix, y_block) 
+            
+            optimal_coeffs[t] = corr_k.clamp(min=0.0) 
+            correlations_sq[t] = corr_k**2
+
+        max_corr_sq, best_k_idx = correlations_sq.max(dim=1)
+        
+        segment_costs = lam - max_corr_sq
+        
+        V = torch.zeros(T_Z + 1, device=device)
+        t_prev_opt = torch.zeros(T_Z + 1, dtype=torch.long, device=device) 
+        V[:L] = 0.0
+
+        for t in range(L, T_Z + 1):
+            idx_Z = t - L 
+            
+            cost_no_activation = V[t-1]
+            
+            cost_with_activation = V[idx_Z] + segment_costs[idx_Z]
+            
+            if cost_with_activation < cost_no_activation:
+                V[t] = cost_with_activation
+                t_prev_opt[t] = t - L 
+            else:
+                V[t] = cost_no_activation
+                t_prev_opt[t] = t_prev_opt[t-1] 
+
+        
+        current_t = T_Z
+        while current_t >= L:
+            if t_prev_opt[current_t] == current_t - L:
+                t_start = current_t - L
+                idx_Z = t_start
+                
+                best_k = best_k_idx[idx_Z]
+                
+                Z_out[s, best_k, idx_Z] = optimal_coeffs[idx_Z, best_k]
+                
+                current_t = t_start
+            else:
+                current_t -= 1
+    
+    return Z_out.detach()
+
+
 
 #####################################################################
 #                                                                   #
@@ -361,7 +549,7 @@ def CSC_l0_NMS(X, Z, phi, lam, step_size=0.01, n_inner=20, nms_radius=1):
 #                                                                   #
 #####################################################################
 
-def CDU(X, Z, phi, n_iters=50, lr=1e-2):
+def CDU(X, Z, phi, n_iters=500, lr=5e-1):
     """
     Optimize phi with 0.5||X - sum_k z_k * phi_k||^2, s.t. ||phi_k||=1
     X:   (S,N,P)
@@ -399,50 +587,43 @@ def CDU(X, Z, phi, n_iters=50, lr=1e-2):
 #                                                                   #
 #####################################################################
 
-def time_warping_f(phi_k, a_k_s, sigma=0.01):
+def time_warping_f(phi_k, a_k_s, sigma=0.1):
     """
-    Applique la transformation de time warping f sur un atome phi_k avec un paramètre a_k_s.
-
-    Inputs:
-        phi_k: Tensor de taille (L, P)
-        a_k_s: Tensor de taille (M,)
-        sigma: float, paramètre de lissage pour l'interpolation
-
-    Output:
-        warped_phi: Tensor de taille (L, P)
+    Time-warping 1D strict (interpolation linéaire)
+    Pas de grid_sample, pas de lissage transversal.
+    
+    phi_k: (L,P)
+    a_k_s: (M,)
+    return: (L,P)
     """
     L, P = phi_k.shape
     M = a_k_s.shape[0]
-    
-    assert phi_k.ndim == 2, f"phi_k doit être de dimension 2, got {phi_k.ndim}"
-    assert a_k_s.ndim == 1, f"a_k_s doit être de dimension 1, got {a_k_s.ndim}"
-
     device = phi_k.device
 
-    # 1. Temps échantillonnés uniformes
-    t_i = torch.linspace(0, 1, L, device=device)  # shape (L,)
+    # timeline
+    t_i = torch.linspace(0, 1, L, device=device)
 
-    # 2. Construction du time warping ψ_a(t)
+    # Fourier-based displacement (comme ta version originale)
     w = torch.arange(1, M + 1, device=device, dtype=torch.float32)
     b_w = torch.sin(w[None, :] * math.pi * t_i[:, None]) / (w[None, :] * math.pi)
     displacement = b_w @ a_k_s
-    psi_a_t = t_i + displacement
-    psi_a_t = torch.clamp(psi_a_t, 0.0, 1.0)
 
-    # 3. Interpolation linéaire différentiable
-    # Échelle psi_a_t dans [0, L-1]
+    # warp map
+    psi_a_t = torch.clamp(t_i + displacement, 0.0, 1.0)
     x = psi_a_t * (L - 1)
+
+    # indices d'interpolation linéaire
     x0 = torch.floor(x).long()
     x1 = torch.clamp(x0 + 1, max=L - 1)
-    alpha = (x - x0.float()).unsqueeze(-1)  # poids pour l'interpolation linéaire
+    alpha = (x - x0.float()).unsqueeze(-1)   # (L,1)
 
-    # Récupérer les valeurs correspondantes
-    phi0 = phi_k[x0]      # (L, P)
-    phi1 = phi_k[x1]      # (L, P)
+    # lookup propre, pas de broadcast bug
+    phi0 = phi_k[x0]          # (L,P)
+    phi1 = phi_k[x1]          # (L,P)
 
-    warped_phi = phi0 * (1 - alpha) + phi1 * alpha  # interpolation linéaire
-
+    warped_phi = phi0 * (1 - alpha) + phi1 * alpha
     return warped_phi
+
 
 
 #####################################################################
@@ -484,21 +665,16 @@ def IPU(X, Z, Phi, A, f=time_warping_f,n_iters=50, lr=1e-2, sigma=0.01):
     for _ in range(n_iters):
         opt.zero_grad()
 
-        # On reconstruit tous les atomes déformés f(phi_k, a_k^s)
         warped_Phi = torch.zeros((S, K, L, P), device=device)
         for s in range(S):
             for k in range(K):
                 warped_Phi[s, k] = f(Phi[k], A[s, k], sigma=sigma)
 
-        # Reconstruction : X_hat[s] = sum_k z_k^s * warped_phi_k^s
-        # Pour utiliser la même fonction que CDU, on doit moyenner sur s
         X_hat = torch.zeros((S, N, P), device=device)
         for s in range(S):
-            # Convolution 1D sur le signal s, en sommant sur K
             weight = warped_Phi[s].permute(2, 0, 1).flip(-1).contiguous()  # (P,K,L)
             X_hat[s] = F.conv1d(Z[s].unsqueeze(0), weight, padding=L - 1).permute(0, 2, 1)[0, :N, :]
 
-        # Calcul de la perte
         loss = 0.5 * torch.sum((X - X_hat) ** 2)
         loss.backward()
         opt.step()
@@ -511,36 +687,137 @@ def IPU(X, Z, Phi, A, f=time_warping_f,n_iters=50, lr=1e-2, sigma=0.01):
 #                                                                   #
 #####################################################################
     
-def PerCDU(X,Z,phi,A,func=time_warping_f,sigma=0.01,n_iters=50, lr=1e-2):
+def inverse_warp_patch(y_patch, a_k_s, L=None):
     """
-    Optimize phi with 0.5||X - sum_k z_k * phi_k||^2, s.t. ||phi_k||=1
-    X:   (S,N,P)
-    Z:   (S,K,T)
-    phi: (K,L,P)
-    returns: updated phi (K,L,P)
+    Inverse-warp a single patch y_patch of shape (L, P) back to canonical frame.
+    Uses the same displacement basis as time_warping_f and numpy.interp to invert psi.
+    Returns aligned_patch (L, P) on same dtype/device as input.
+    """
+    # y_patch : (L, P) tensor
+    device = y_patch.device
+    dtype = y_patch.dtype
+    if L is None:
+        L = y_patch.shape[0]
+    M = a_k_s.shape[0]
+
+    # timeline [0,1]
+    t_i = torch.linspace(0.0, 1.0, L, device=device, dtype=dtype)
+
+    # build displacement like in time_warping_f
+    w = torch.arange(1, M + 1, device=device, dtype=dtype)
+    # b_w: (L, M)
+    b_w = torch.sin(w[None, :] * math.pi * t_i[:, None]) / (w[None, :] * math.pi)
+    displacement = b_w @ a_k_s  # (L,)
+
+    psi = torch.clamp(t_i + displacement, 0.0, 1.0)  # (L,)
+
+    # we'll invert psi: for canonical grid u_j = t_i we want t = psi^{-1}(u)
+    psi_cpu = psi.detach().cpu().numpy()
+    t_cpu = t_i.detach().cpu().numpy()
+    u_cpu = t_cpu  # same grid
+
+    # if psi not strictly monotonic, np.interp will still do something (piecewise)
+    t_of_u = np.interp(u_cpu, psi_cpu, t_cpu)  # gives t corresponding to each u
+
+    # map to sample locations in [0, L-1]
+    x = t_of_u * (L - 1)  # float positions
+    # linear interpolation of y_patch along axis 0
+    y_np = y_patch.detach().cpu().numpy()  # (L, P)
+    L_int, P = y_np.shape
+
+    # sample for each dim p
+    aligned = np.empty((L, P), dtype=y_np.dtype)
+    x0 = np.floor(x).astype(int)
+    x1 = np.clip(x0 + 1, 0, L_int - 1)
+    alpha = (x - x0).reshape(-1, 1)
+
+    aligned = (1.0 - alpha) * y_np[x0, :] + alpha * y_np[x1, :]
+
+    aligned_t = torch.from_numpy(aligned).to(device=device, dtype=dtype)
+    return aligned_t
+
+
+def PerCDU(X, Z, phi, A, alpha_blend=0.02, lambda_reg=5e-3):
+    """
+    PerCDU stable sans min_count_threshold.
+    
+    X : (S,N,P)
+    Z : (S,K,T)
+    phi : (K,L,P)
+    A : (S,K,M)
+    func : time-warping function f(phi_k, a_sk)
+    alpha_blend : blending step to control atom drift
+    lambda_reg : ridge regularization toward previous phi
+    
+    Retourne :
+        final_phi : (K,L,P)  (detach, normalized)
     """
     device = X.device
+    dtype  = X.dtype
+
     S, N, P = X.shape
     K, L, P2 = phi.shape
     assert P2 == P
 
-    X = to_tensor(X, device)
-    Z = to_tensor(Z, device)
-    phi = to_tensor(phi, device, requires_grad=True)
-    phi = torch.nn.Parameter(phi)
+    X_t  = X.to(device)
+    Z_t  = Z.to(device)
+    A_t  = A.to(device)
+    phi_old = phi.to(device)
 
-    opt = torch.optim.Adam([phi], lr=lr)
+    new_phi_est = torch.zeros_like(phi_old, device=device, dtype=dtype)
 
-    for _ in range(n_iters):
-        opt.zero_grad()
-        X_hat = reconstruct_from_Z_phi_personalized(Z, phi, A, f=func, N=N) # (S,N,P)
-        loss = 0.5 * torch.sum((X - X_hat) ** 2)
-        loss.backward()
-        opt.step()
-        with torch.no_grad():
-            unit_norm_atoms_(phi)
+    T = Z_t.shape[2]  # T = N - L + 1
 
-    return phi.detach()
+    # ---- Compute new phi (closed-form average of inverse-warped patches) ----
+    for k in range(K):
+        numer = torch.zeros((L, P), device=device, dtype=dtype)
+        denom = 0.0
+
+        for s in range(S):
+            z_sk = Z_t[s, k]  # (T,)
+            idxs = torch.nonzero(z_sk > 0, as_tuple=False).squeeze(-1)
+            if idxs.numel() == 0:
+                continue
+
+            a_sk = A_t[s, k]  # (M,)
+
+            for t_idx in idxs.tolist():
+                start = t_idx
+                end = t_idx + L
+                if end > N:
+                    continue
+                y_patch = X_t[s, start:end, :]    # (L, P)
+
+                aligned = inverse_warp_patch(y_patch, a_sk, L=L)  # (L,P)
+
+                weight = float(z_sk[t_idx].detach().cpu().item())
+                numer += weight * aligned
+                denom += weight
+
+        # ---- Regularization towards old phi ----
+        if denom > 0:
+            numer = numer + lambda_reg * phi_old[k]
+            denom = denom + lambda_reg
+
+            new_phi_est[k] = numer / (denom + 1e-12)
+        else:
+            # no occurrences: keep the previous atom
+            new_phi_est[k] = phi_old[k].clone()
+
+    # ---- Normalize new_phi_est ----
+    norms = new_phi_est.view(K, -1).norm(p=2, dim=1).view(K, 1, 1)
+    norms = torch.clamp(norms, min=1e-12)
+    new_phi_est = new_phi_est / norms
+
+    # ---- Blend with previous atoms (stabilization) ----
+    final_phi = (1.0 - alpha_blend) * phi_old + alpha_blend * new_phi_est
+
+    # ---- Normalize final phi ----
+    norms = final_phi.view(K, -1).norm(p=2, dim=1).view(K, 1, 1)
+    norms = torch.clamp(norms, min=1e-12)
+    final_phi = final_phi / norms
+
+    return final_phi.detach()
 
 
 #####################################################################
@@ -550,7 +827,7 @@ def PerCDU(X,Z,phi,A,func=time_warping_f,sigma=0.01,n_iters=50, lr=1e-2):
 #####################################################################
 
 
-def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=8,n_iters=100,n_perso=100):
+def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,n_iters=100,n_perso=100):
     
     K = nb_atoms
     L = atoms_length
@@ -560,14 +837,23 @@ def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=8,n_i
  
 
     for it in range(n_iters):
-        Z = CSC_l0_NMS(X, Z, Phi, lambda_,nms_radius=3)
-        Phi = CDU(X, Z, Phi)
+        Z = CSC_L0_DP(X, Z, Phi, lambda_)
+        Phi = CDU(X, Z, Phi,lr=5e-2)
 
 
     for it in range(n_perso):
         A = IPU(X, Z, Phi, A,f=func)
-        Z = CSC_l0_NMS(X, Z, Phi, lambda_,nms_radius=3)
+        Z = CSC_L0_DP(X, Z, Phi, lambda_)
         Phi = PerCDU(X, Z, Phi, A,func=func)
+
+    return A,Z,Phi
+
+def Personalization(X,A,Z,Phi,lambda_=0.01,func=time_warping_f,n_perso=100):
+
+    for it in range(n_perso):
+        A = IPU(X, Z, Phi, A,f=func)
+        Z = CSC_L0_DP(X, Z, Phi, lambda_)
+        Phi = PerCDU(X, Z, Phi, A)
 
     return A,Z,Phi
 
@@ -577,7 +863,7 @@ def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=8,n_i
 #                                                                   #
 #####################################################################
 
-def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=8,n_iters=100):
+def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100):
     
     K = nb_atoms
     L = atoms_length
@@ -587,7 +873,7 @@ def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=8,n_iters=100):
  
 
     for it in range(n_iters):
-        Z = CSC_l0_NMS(X, Z, Phi, lambda_,nms_radius=3)
-        Phi = CDU(X, Z, Phi)
+        Z = CSC_L0_DP(X, Z, Phi, lambda_)
+        Phi = CDU(X, Z, Phi,lr=5e-2)
 
-    return Z,Phi
+    return Z,Phi,A
