@@ -25,6 +25,8 @@ import os
 import tarfile
 from urllib.request import urlretrieve
 from scipy.signal import butter, filtfilt, welch
+from scipy import interpolate
+from typing import Tuple
 
 #####################################################################
 #                                                                   #
@@ -175,6 +177,100 @@ def setInitialValues(X,K,M,L):
 
     return Phi, Z, A
 
+def setInitialValues_pers(X: np.ndarray, K: int, M: int, L: int,
+                     patterns_filepath: str = "patterns_bruts_sujet_1_essai_1.json",seed=42) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Set initial values for the parameters of PerCDL, en utilisant les patterns bruts.
+
+    Parameters:
+    - X: Données des signaux (S x N x P)
+    - K: number of common atoms in the dictionary (Doit être 2 pour cet exemple)
+    - M: number of personalization components (paramètre non utilisé dans l'initialisation de Phi)
+    - L: length of each atom (nombre d'échantillons temporels)
+    - patterns_filepath: Chemin vers le fichier JSON des patterns bruts.
+
+    Returns:
+    - Phi: initial common dictionary (K x L x P)
+    - Z: initial activations (S x K x N-L+1)
+    - A: initial personalization parameters (S x K x M)
+    """
+    
+    # 1. Détermination des dimensions
+    S, N, P = X.shape  
+    
+    # Vérification pour s'assurer que P est 3 comme prévu (RAV, RAZ, RRY)
+    if P != 3:
+        raise ValueError(f"P doit être 3 (RAV, RAZ, RRY) pour cette initialisation. P actuel : {P}")
+    if K != 2:
+        print(f"⚠️ Avertissement: K n'est pas 2. L'initialisation prendra le premier pattern (RAZ) pour K atomes.")
+
+    # Définition des canaux que nous souhaitons utiliser pour Phi (basé sur P=3)
+    CHANNELS = ['RAV', 'RAZ', 'RRY'] # Remplacez par l'ordre réel si différent
+
+    # 2. Chargement et extraction des patterns bruts
+    try:
+        with open(patterns_filepath, 'r') as f:
+            raw_patterns = json.load(f)
+    except FileNotFoundError:
+        print(f"⚠️ Fichier non trouvé: {patterns_filepath}. Initialisation de Phi aléatoire.")
+        Phi = torch.randn(K, L, P) * 1.0
+        Phi = unit_norm_atoms_(Phi)
+    else:
+        # Stocker les patterns pour les 3 canaux dans un tableau (P=3)
+        initial_atoms = []
+        
+        # Pour K=2, nous allons initialiser un atome avec le pattern Droit et l'autre avec le pattern Gauche
+        # Nous faisons la moyenne des 3 canaux pour chaque atome pour l'instant.
+        
+        # Structure de Phi à construire : (K x L x P)
+
+        # Créer le tenseur initial Phi (K=2, L=L, P=3)
+        Phi_init_tensor = torch.zeros(K, L, P)
+        
+        # Itération sur les K atomes (K=0: Cycle Droit, K=1: Cycle Gauche)
+        for k_idx in range(K):
+            cycle_side = 'Right' if k_idx == 0 else 'Left'
+            
+            # Itération sur les P canaux (P=0: RAV, P=1: RAZ, P=2: RRY)
+            for p_idx, channel_name in enumerate(CHANNELS):
+                key = f'{channel_name}_{cycle_side}'
+                
+                if key in raw_patterns and raw_patterns[key]:
+                    # Charger le pattern brut (liste -> tableau numpy)
+                    pattern_raw = np.array(raw_patterns[key])
+                    
+                    # 3. Redimensionnement (interpolation) à la longueur L
+                    if pattern_raw.size >= 2:
+                        # Créer une fonction d'interpolation cubique
+                        time_raw = np.arange(pattern_raw.size)
+                        f = interpolate.interp1d(time_raw, pattern_raw, kind='cubic')
+                        
+                        # Rééchantillonner à la longueur L
+                        time_new = np.linspace(0, pattern_raw.size - 1, L)
+                        pattern_resampled = f(time_new)
+                        
+                        # Insérer dans le tenseur Phi_init_tensor
+                        Phi_init_tensor[k_idx, :, p_idx] = torch.from_numpy(pattern_resampled).float()
+                    else:
+                        print(f"⚠️ Pattern {key} trop court, initialisation aléatoire pour cette composante.")
+                        Phi_init_tensor[k_idx, :, p_idx] = torch.randn(L)
+                else:
+                    print(f"⚠️ Pattern {key} manquant, initialisation aléatoire pour cette composante.")
+                    Phi_init_tensor[k_idx, :, p_idx] = torch.randn(L)
+        
+        Phi = Phi_init_tensor
+
+    # 4. Normalisation
+    if seed is not None:
+        torch.manual_seed(seed)
+    Phi = Phi +torch.randn(K, L, P) * 0.2  # Petite perturbation aléatoire
+    Phi = unit_norm_atoms_(Phi)
+
+    # 5. Initialisation des autres paramètres
+    Z = torch.rand(S, K, N-L+1).float() * 0.01 # Initialisation basse pour Z
+    A = torch.zeros(S, K, M).float()
+
+    return Phi, Z, A
 
 
 #####################################################################
@@ -429,11 +525,21 @@ def CSC_L0_DP(X, Z, phi, lam, eps_reg=1e-6):
         reconstruction_norm_sq = torch.zeros(T_Z, device=device)
 
         for t in range(T_Z):
-            y_block = x_s[t:t+L, :].reshape(-1)  # (L*P,)
+            y_block = x_s[t:t+L, :].reshape(-1)
+            
+            # Unfiltered coefficients
             u_t = P_tilde @ y_block
-            optimal_coeffs[t] = u_t
 
-            reconstruction = D_matrix @ u_t
+            # Winner-takes-all selection
+            k_star = torch.argmax(torch.abs(u_t))
+            u_t_filtered = torch.zeros_like(u_t)
+            u_t_filtered[k_star] = u_t[k_star]
+
+            # Store filtered coefficients
+            optimal_coeffs[t] = u_t_filtered
+
+            # IMPORTANT: compute reconstruction with filtered coefficients
+            reconstruction = D_matrix @ u_t_filtered
             reconstruction_norm_sq[t] = torch.sum(reconstruction ** 2)
 
         segment_costs = lam - reconstruction_norm_sq  # length T_Z
@@ -828,13 +934,13 @@ def PerCDU(X, Z, phi, A, alpha_blend=0.02, lambda_reg=5e-3):
 #####################################################################
 
 
-def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,n_iters=100,n_perso=100):
+def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,n_iters=100,n_perso=100,seed=None):
     
     K = nb_atoms
     L = atoms_length
     M=D*W
 
-    Phi, Z, A = setInitialValues(X,K,M,L)
+    Phi, Z, A = setInitialValues_pers(X,K,M,L,seed=seed)
  
 
     for it in range(n_iters):
@@ -864,13 +970,13 @@ def Personalization(X,A,Z,Phi,lambda_=0.01,func=time_warping_f,n_perso=100):
 #                                                                   #
 #####################################################################
 
-def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100):
+def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100,seed=None):
     
     K = nb_atoms
     L = atoms_length
     M=D*W
 
-    Phi, Z, A = setInitialValues(X,K,M,L)
+    Phi, Z, A = setInitialValues_pers(X,K,M,L,seed=seed)
  
 
     for it in range(n_iters):
