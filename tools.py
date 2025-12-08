@@ -966,7 +966,7 @@ def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,
     for it in range(n_perso):
         A = IPU(X, Z, Phi, A,f=func)
         Z = CSC_L0_DP(X, Z, Phi, lambda_)
-        Phi = PerCDU(X, Z, Phi, A,func=func)
+        Phi = PerCDU(X, Z, Phi, A)
 
     return A,Z,Phi
 
