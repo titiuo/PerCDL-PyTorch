@@ -26,7 +26,7 @@ import tarfile
 from urllib.request import urlretrieve
 from scipy.signal import butter, filtfilt, welch
 from scipy import interpolate
-from typing import Tuple
+from typing import Tuple, List
 
 #####################################################################
 #                                                                   #
@@ -177,97 +177,112 @@ def setInitialValues(X,K,M,L):
 
     return Phi, Z, A
 
-def setInitialValues_pers(X: np.ndarray, K: int, M: int, L: int,
-                     patterns_filepath: str = "patterns_bruts_sujet_1_essai_1.json",seed=42) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def setInitialValues_pers(
+    X: np.ndarray, 
+    K: int, 
+    M: int, 
+    L: int, 
+    signal_names: List[str],
+    patterns_filepath: str = "patterns_bruts_sujet_1_essai_1.json",
+    seed: int = 42
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Set initial values for the parameters of PerCDL, en utilisant les patterns bruts.
+    Set initial values for PerCDL parameters using raw JSON patterns.
+    Generalized for any number of channels (P) provided via signal_names.
 
     Parameters:
-    - X: Données des signaux (S x N x P)
-    - K: number of common atoms in the dictionary (Doit être 2 pour cet exemple)
-    - M: number of personalization components (paramètre non utilisé dans l'initialisation de Phi)
-    - L: length of each atom (nombre d'échantillons temporels)
-    - patterns_filepath: Chemin vers le fichier JSON des patterns bruts.
+    - X: Signal data (S x N x P)
+    - K: Number of common atoms in the dictionary.
+    - M: Number of personalization components.
+    - L: Length of each atom (time samples).
+    - signal_names: List of strings matching the channels in X (e.g., ['RAV', 'RAZ', 'RRY']).
+    - patterns_filepath: Path to the JSON file containing raw patterns.
+    - seed: Random seed for reproducibility.
 
     Returns:
-    - Phi: initial common dictionary (K x L x P)
-    - Z: initial activations (S x K x N-L+1)
-    - A: initial personalization parameters (S x K x M)
+    - Phi: Initial common dictionary (K x L x P)
+    - Z: Initial activations (S x K x N-L+1)
+    - A: Initial personalization parameters (S x K x M)
     """
     
-    # 1. Détermination des dimensions
+    # 1. Determine dimensions
+    # S: Subjects, N: Time points, P: Channels
     S, N, P = X.shape  
     
-    # Vérification pour s'assurer que P est 3 comme prévu (RAV, RAZ, RRY)
-    if P != 3:
-        raise ValueError(f"P doit être 3 (RAV, RAZ, RRY) pour cette initialisation. P actuel : {P}")
-    if K != 2:
-        print(f"⚠️ Avertissement: K n'est pas 2. L'initialisation prendra le premier pattern (RAZ) pour K atomes.")
+    # Validation: Ensure signal_names matches data dimension P
+    if len(signal_names) != P:
+        raise ValueError(f"Length of signal_names ({len(signal_names)}) must match number of channels in X (P={P}).")
 
-    # Définition des canaux que nous souhaitons utiliser pour Phi (basé sur P=3)
-    CHANNELS = ['RAV', 'RAZ', 'RRY'] # Remplacez par l'ordre réel si différent
+    if seed is not None:
+        torch.manual_seed(seed)
 
-    # 2. Chargement et extraction des patterns bruts
+    # 2. Load and Extract Raw Patterns
     try:
         with open(patterns_filepath, 'r') as f:
             raw_patterns = json.load(f)
     except FileNotFoundError:
-        print(f"⚠️ Fichier non trouvé: {patterns_filepath}. Initialisation de Phi aléatoire.")
-        Phi = torch.randn(K, L, P) * 1.0
+        print(f"⚠️ File not found: {patterns_filepath}. Initializing Phi randomly.")
+        Phi = torch.randn(K, L, P)
         Phi = unit_norm_atoms_(Phi)
     else:
-        # Stocker les patterns pour les 3 canaux dans un tableau (P=3)
-        initial_atoms = []
-        
-        # Pour K=2, nous allons initialiser un atome avec le pattern Droit et l'autre avec le pattern Gauche
-        # Nous faisons la moyenne des 3 canaux pour chaque atome pour l'instant.
-        
-        # Structure de Phi à construire : (K x L x P)
-
-        # Créer le tenseur initial Phi (K=2, L=L, P=3)
+        # Initialize Phi tensor (K x L x P)
         Phi_init_tensor = torch.zeros(K, L, P)
         
-        # Itération sur les K atomes (K=0: Cycle Droit, K=1: Cycle Gauche)
+        # Define suffixes for patterns (assuming JSON keys are like 'SignalName_Right' or 'SignalName_Left')
+        # If K > 2, this will cycle: Atom 0->Right, Atom 1->Left, Atom 2->Right...
+        cycle_suffixes = ['Right', 'Left']
+
+        # Loop over Atoms (K)
         for k_idx in range(K):
-            cycle_side = 'Right' if k_idx == 0 else 'Left'
+            # Determine if this atom represents Right or Left based on index
+            current_suffix = cycle_suffixes[k_idx % len(cycle_suffixes)]
             
-            # Itération sur les P canaux (P=0: RAV, P=1: RAZ, P=2: RRY)
-            for p_idx, channel_name in enumerate(CHANNELS):
-                key = f'{channel_name}_{cycle_side}'
+            # Loop over Channels (P) using the provided names
+            for p_idx, channel_name in enumerate(signal_names):
+                
+                # Construct the key expected in the JSON (e.g., "RAV_Right")
+                key = f'{channel_name}_{current_suffix}'
                 
                 if key in raw_patterns and raw_patterns[key]:
-                    # Charger le pattern brut (liste -> tableau numpy)
+                    # Convert list to numpy array
                     pattern_raw = np.array(raw_patterns[key])
                     
-                    # 3. Redimensionnement (interpolation) à la longueur L
+                    # 3. Resampling / Interpolation to length L
                     if pattern_raw.size >= 2:
-                        # Créer une fonction d'interpolation cubique
+                        # Cubic interpolation function
                         time_raw = np.arange(pattern_raw.size)
-                        f = interpolate.interp1d(time_raw, pattern_raw, kind='cubic')
+                        f_interp = interpolate.interp1d(time_raw, pattern_raw, kind='cubic')
                         
-                        # Rééchantillonner à la longueur L
+                        # Resample to new length L
                         time_new = np.linspace(0, pattern_raw.size - 1, L)
-                        pattern_resampled = f(time_new)
+                        pattern_resampled = f_interp(time_new)
                         
-                        # Insérer dans le tenseur Phi_init_tensor
+                        # Assign to Tensor
                         Phi_init_tensor[k_idx, :, p_idx] = torch.from_numpy(pattern_resampled).float()
                     else:
-                        print(f"⚠️ Pattern {key} trop court, initialisation aléatoire pour cette composante.")
+                        print(f"⚠️ Pattern {key} is too short. Random init for this channel/atom.")
                         Phi_init_tensor[k_idx, :, p_idx] = torch.randn(L)
                 else:
-                    print(f"⚠️ Pattern {key} manquant, initialisation aléatoire pour cette composante.")
+                    # If the specific channel key is missing in JSON, init randomly
+                    # Only warns if K is small to avoid spamming console for large K
+                    if K <= 4:
+                        print(f"⚠️ Pattern key '{key}' missing. Random init for this channel/atom.")
                     Phi_init_tensor[k_idx, :, p_idx] = torch.randn(L)
         
         Phi = Phi_init_tensor
 
-    # 4. Normalisation
-    if seed is not None:
-        torch.manual_seed(seed)
-    Phi = Phi +torch.randn(K, L, P) * 0.2  # Petite perturbation aléatoire
+    # 4. Normalization and Perturbation
+    # Add small noise to break perfect symmetries if data is synthetic
+    Phi = Phi + torch.randn(K, L, P) * 0.1 
+    
+    # Normalize atoms to unit norm
     Phi = unit_norm_atoms_(Phi)
 
-    # 5. Initialisation des autres paramètres
-    Z = torch.rand(S, K, N-L+1).float() * 0.01 # Initialisation basse pour Z
+    # 5. Initialize other parameters
+    # Z: Sparse activations (initialized with small random values)
+    Z = torch.rand(S, K, N - L + 1).float() * 0.01 
+    
+    # A: Personalization weights (initialized to zero)
     A = torch.zeros(S, K, M).float()
 
     return Phi, Z, A
@@ -934,13 +949,13 @@ def PerCDU(X, Z, phi, A, alpha_blend=0.02, lambda_reg=5e-3):
 #####################################################################
 
 
-def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,n_iters=100,n_perso=100,seed=None):
+def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,n_iters=100,n_perso=100,signal_names=None,seed=None):
     
     K = nb_atoms
     L = atoms_length
     M=D*W
 
-    Phi, Z, A = setInitialValues_pers(X,K,M,L,seed=seed)
+    Phi, Z, A = setInitialValues_pers(X,K,M,L,signal_names=signal_names,seed=seed)
  
 
     for it in range(n_iters):
@@ -970,13 +985,13 @@ def Personalization(X,A,Z,Phi,lambda_=0.01,func=time_warping_f,n_perso=100):
 #                                                                   #
 #####################################################################
 
-def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100,seed=None):
+def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100,signal_names=None,seed=None):
     
     K = nb_atoms
     L = atoms_length
     M=D*W
 
-    Phi, Z, A = setInitialValues_pers(X,K,M,L,seed=seed)
+    Phi, Z, A = setInitialValues_pers(X,K,M,L,signal_names=signal_names,seed=seed)
  
 
     for it in range(n_iters):
@@ -1036,57 +1051,92 @@ def apply_low_pass(X, cutoff, fs, order=5):
         # Apply along axis 1 (Time)
         return filtfilt(b, a, X, axis=1)
 
-def find_optimal_cutoff(X, fs, percentile=[0.95,0.95,0.95],subject = None):
+def find_optimal_cutoff(X, fs, percentile=0.95, subject=None):
     """
     Estimates the optimal cutoff frequency based on Cumulative Power.
+    Generalized for any number of channels P.
     
     Parameters:
     - X (np.array): Data of shape (S, N, P)
     - fs (float): Sampling frequency (Hz)
-    - percentile (float): Fraction of energy to keep (0.95 = 95%)
-    - method (str): 'global' (averages PSD first, returns 1 float)
-                    'per_channel' (returns array of shape P)
-                    'per_signal' (returns array of shape S x P)
+    - percentile (float or list): Fraction of energy to keep. 
+                                  If float (e.g., 0.95), applies to all channels.
+                                  If list, must be length P.
+    - subject (int, optional): If provided, plots the PSD and cutoff for this subject.
     
     Returns:
-    - cutoff (float or np.array): The suggested cutoff frequency/frequencies.
+    - cutoff_freqs (np.array): Array of shape (S, P) containing cutoff frequencies.
     """
-    # 1. Compute PSD using Welch's method
-    # axis=1 is the time dimension (N)
-    freqs, psd = welch(X, fs=fs, nperseg=min(X.shape[1], 256), axis=1)
+    S, N, P = X.shape
 
-    
-    # 2. Handle aggregation 
-    # No averaging, keep all signals distinct
-    # Result shape: (S, Frequency_Bins, P) -> Transpose to (S, P, Frequency_Bins)
+    # 1. Handle Percentile Logic
+    # If it's a single float, replicate it for all P channels.
+    if isinstance(percentile, (float, int)):
+        percentile = [percentile] * P
+    elif len(percentile) != P:
+        raise ValueError(f"Percentile list length ({len(percentile)}) must match number of channels P={P}.")
+
+    # 2. Compute PSD using Welch's method
+    # axis=1 is the time dimension (N). Result shape: (S, Frequency_Bins, P)
+    freqs, psd = welch(X, fs=fs, nperseg=min(N, 256), axis=1)
+
+    # 3. Transpose to (S, P, Frequency_Bins) for easier broadcasting
     psd_processed = np.transpose(psd, (0, 2, 1))
 
-    # 3. Calculate Cumulative Distribution of Power
-    # Integrate (cumsum) along the last axis (Frequency bins)
+    # 4. Calculate Cumulative Distribution of Power
     psd_cumsum = np.cumsum(psd_processed, axis=-1)
     
-    # Normalize by total power (last value of cumsum) to get 0.0 to 1.0 scale
+    # Normalize by total power (last value of cumsum)
     total_power = psd_cumsum[..., -1:]
+    # Avoid division by zero
+    total_power[total_power == 0] = 1.0 
     psd_normalized = psd_cumsum / total_power
     
-    # 4. Find the frequency index where we cross the percentile threshold
-    # argmax finds the *first* index where the condition is True
-    cutoff_indices = [[np.argmax(psd_normalized[s, p, :] >= percentile[p])for p in range(X.shape[2]) ] for s in range(X.shape[0])]
+    # 5. Find indices where we cross the percentile threshold
+    # We construct a (S, P) array of indices
+    cutoff_indices = np.zeros((S, P), dtype=int)
     
-    # 5. Convert indices to actual Frequencies
-    cutoff_freqs = freqs[cutoff_indices]
+    for s in range(S):
+        for p in range(P):
+            # argmax returns the first index where condition is True
+            cutoff_indices[s, p] = np.argmax(psd_normalized[s, p, :] >= percentile[p])
+    
+    # 6. Convert indices to actual Frequencies
+    cutoff_freqs = freqs[cutoff_indices] # Shape (S, P)
 
+    # 7. Visualization (if subject is specified)
     if subject is not None:
-        cutoff_freq = cutoff_freqs[subject]
-        channels = X.shape[2]
-        fig,axs = plt.subplots(channels,1,figsize=(8,channels*2))
-        for p in range(channels):
-            axs[p].plot(freqs, psd[subject,:,p], label='PSD')
-            axs[p].axvline(cutoff_freq[p], color='r', linestyle='--', label='Cutoff')
-            axs[p].set_title(f'Channel {p+1} - Cutoff: {cutoff_freq[p]:.2f} Hz')
-            axs[p].set_xlabel('Frequency (Hz)')
-            axs[p].set_ylabel('Power/Frequency (V**2/Hz)')
-            axs[p].legend()
-        plt.tight_layout()
+        if subject >= S:
+            print(f"Error: Subject {subject} out of bounds (max {S-1}).")
+            return cutoff_freqs
+
+        print(f"--- PSD and Cutoff Frequencies for Subject {subject} ---")
+        
+        cutoff_s = cutoff_freqs[subject] # Shape (P,)
+        
+        # squeeze=False ensures axs is always iterable (even if P=1)
+        fig, axs = plt.subplots(P, 1, figsize=(10, 3 * P), constrained_layout=True, squeeze=False)
+        
+        for p in range(P):
+            ax = axs[p, 0]
+            
+            # Plot PSD for this channel
+            # psd shape is (S, Freqs, P), so we want psd[subject, :, p]
+            ax.plot(freqs, psd[subject, :, p], label='PSD', color='tab:blue')
+            
+            # Plot Cutoff line
+            c_freq = cutoff_s[p]
+            ax.axvline(c_freq, color='tab:red', linestyle='--', linewidth=1.5, label=f'Cutoff ({percentile[p]*100:.0f}%)')
+            
+            ax.set_title(f'Channel {p} - Cutoff: {c_freq:.2f} Hz')
+            ax.set_ylabel('Power Density (V²/Hz)')
+            ax.legend(loc='upper right')
+            ax.grid(True, linestyle=':', alpha=0.6)
+            
+            # Only set xlabel for the bottom plot to reduce clutter
+            if p == P - 1:
+                ax.set_xlabel('Frequency (Hz)')
+
+        plt.show()
     
     return cutoff_freqs
