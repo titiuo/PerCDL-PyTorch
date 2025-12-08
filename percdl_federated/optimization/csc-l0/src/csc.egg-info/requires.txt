@@ -1,0 +1,13 @@
+einops
+joblib
+loadmydata
+numexpr
+numpy
+ruptures
+scikit-learn
+scipy
+wfdb
+
+[test]
+pytest
+pytest-cov

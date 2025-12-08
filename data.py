@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-FOLDER = "../../Immersion Hopital/497-main/GaitData"
+FOLDER = "./GaitData"
 COLUMN_NAMES = ['TOX', 'TAX', 'TAY', 'RAV', 'RAZ', 'RRY', 'LAV', 'LAZ', 'LRY']
 
 def load_metadata(subject, trial):

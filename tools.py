@@ -1036,7 +1036,7 @@ def apply_low_pass(X, cutoff, fs, order=5):
         # Apply along axis 1 (Time)
         return filtfilt(b, a, X, axis=1)
 
-def find_optimal_cutoff(X, fs, percentile=0.95, method='global'):
+def find_optimal_cutoff(X, fs, percentile=[0.95,0.95,0.95],subject = None):
     """
     Estimates the optimal cutoff frequency based on Cumulative Power.
     
@@ -1054,27 +1054,12 @@ def find_optimal_cutoff(X, fs, percentile=0.95, method='global'):
     # 1. Compute PSD using Welch's method
     # axis=1 is the time dimension (N)
     freqs, psd = welch(X, fs=fs, nperseg=min(X.shape[1], 256), axis=1)
+
     
-    # 2. Handle aggregation based on method
-    if method == 'global':
-        # Average PSD across all Observations (axis 0) and Channels (axis 2)
-        # Result shape: (Frequency_Bins,)
-        psd_processed = np.mean(psd, axis=(0, 2))
-        
-    elif method == 'per_channel':
-        # Average PSD across Observations only (axis 0)
-        # Result shape: (Frequency_Bins, P)
-        psd_processed = np.mean(psd, axis=0)
-        # Move frequency to last axis for easier cumulative sum: (P, Frequency_Bins)
-        psd_processed = np.transpose(psd_processed)
-        
-    elif method == 'per_signal':
-        # No averaging, keep all signals distinct
-        # Result shape: (S, Frequency_Bins, P) -> Transpose to (S, P, Frequency_Bins)
-        psd_processed = np.transpose(psd, (0, 2, 1))
-        
-    else:
-        raise ValueError("Method must be 'global', 'per_channel', or 'per_signal'")
+    # 2. Handle aggregation 
+    # No averaging, keep all signals distinct
+    # Result shape: (S, Frequency_Bins, P) -> Transpose to (S, P, Frequency_Bins)
+    psd_processed = np.transpose(psd, (0, 2, 1))
 
     # 3. Calculate Cumulative Distribution of Power
     # Integrate (cumsum) along the last axis (Frequency bins)
@@ -1086,9 +1071,22 @@ def find_optimal_cutoff(X, fs, percentile=0.95, method='global'):
     
     # 4. Find the frequency index where we cross the percentile threshold
     # argmax finds the *first* index where the condition is True
-    cutoff_indices = np.argmax(psd_normalized >= percentile, axis=-1)
+    cutoff_indices = [[np.argmax(psd_normalized[s, p, :] >= percentile[p])for p in range(X.shape[2]) ] for s in range(X.shape[0])]
     
     # 5. Convert indices to actual Frequencies
     cutoff_freqs = freqs[cutoff_indices]
+
+    if subject is not None:
+        cutoff_freq = cutoff_freqs[subject]
+        channels = X.shape[2]
+        fig,axs = plt.subplots(channels,1,figsize=(8,channels*2))
+        for p in range(channels):
+            axs[p].plot(freqs, psd[subject,:,p], label='PSD')
+            axs[p].axvline(cutoff_freq[p], color='r', linestyle='--', label='Cutoff')
+            axs[p].set_title(f'Channel {p+1} - Cutoff: {cutoff_freq[p]:.2f} Hz')
+            axs[p].set_xlabel('Frequency (Hz)')
+            axs[p].set_ylabel('Power/Frequency (V**2/Hz)')
+            axs[p].legend()
+        plt.tight_layout()
     
     return cutoff_freqs

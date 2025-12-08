@@ -283,8 +283,19 @@ def calculate_warped_reconstructions(
     for a given subject (s) and returns CPU data and channel-wise MSEs.
     """
     device = X.device
-    S, N, P = X.shape
-    K, L, P_phi = Phi.shape
+
+    X = X.float()
+    Z = Z.float()
+    Phi = Phi.float()
+    A = A.float()
+    
+    try:
+        S, N, P = X.shape
+        K, L, P_phi = Phi.shape
+    except:
+        S,N = X.shape
+        K,L = Phi.shape
+        P = 1
     
     if s >= S:
         raise ValueError(f"Subject index {s} is out of bounds (max {S-1}).")

@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+setup.cfg
+setup.py
+src/csc/get_path_matrix.c
+src/csc/__init__.py
+src/csc/get_path_matrix.c
+src/csc/sparse_coding.py
+src/csc/utils.py
+src/csc.egg-info/PKG-INFO
+src/csc.egg-info/SOURCES.txt
+src/csc.egg-info/dependency_links.txt
+src/csc.egg-info/requires.txt
+src/csc.egg-info/top_level.txt
+src/csc.egg-info/zip-safe
