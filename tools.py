@@ -949,9 +949,9 @@ def PerCDU(X, Z, phi, A, alpha_blend=0.02, lambda_reg=5e-3):
 #####################################################################
 
 
-def PerCDL(X,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,n_iters=100,n_perso=100,signal_names=None,seed=None):
+def PerCDL(X,nb_atoms,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,n_iters=100,n_perso=100,signal_names=None,seed=None):
     
-    K = len(signal_names)
+    K = nb_atoms
     L = atoms_length
     M=D*W
 
