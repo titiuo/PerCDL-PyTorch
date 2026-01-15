@@ -1,4 +1,3 @@
-
 from ..optimization import (
     _CSC,_CDU_easy, _CDU, _CDU_perso, _IPU,pmap_IPU,_CDU_perso_easy,filter_Z,_IPU_easy,_IPU_reduce,_CD_DTW,
     normalize_Phi_Z, recenter_Phi, relearn_A,l2_loss,_CDU_perso_easy2,_CDU_perso_old_school,_CDU_perso_IPU,_CDU_perso_IPU_federated
